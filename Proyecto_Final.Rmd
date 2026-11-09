@@ -1,0 +1,869 @@
+---
+title: "Proyecto final de econometría | Datos, pronósticos y backtest"
+output:
+  html_document:
+    toc: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE)
+```
+
+
+
+Este primer bloque estudia el rendimiento logarítmico acumulado a una y dos sesiones. Los pronósticos se originan al cierre; su precisión no equivale a la rentabilidad de una estrategia que ejecuta al cierre de la sesión siguiente.
+
+
+
+```{r instalar, eval=FALSE}
+install.packages(c("quantmod", "knitr"))
+```
+
+
+## Regresiones simples a 5 minutos
+
+Se estima una regresión por acción: el rendimiento logarítmico de la acción es la variable dependiente y el rendimiento de VOO del mismo intervalo es la explicativa. Se usa la misma muestra para los diez modelos, incluyendo las observaciones fuera del horario regular cuando los once activos tienen cierres válidos en ambos extremos. 
+
+```{r simples-lseg-datos, message=FALSE, warning=FALSE}
+library(readxl)
+
+# Filas previas al encabezado en los Excel originales de LSEG.
+saltos_5m <- c(AAPL = 29L, MSFT = 28L, AVGO = 29L, AMZN = 30L,
+               ULTA = 29L, TJX = 29L, JPM = 29L, XOM = 29L,
+               ADM = 30L, UNP = 32L, VOO = 31L)
+
+leer_5m <- function(activo) {
+  archivo <- if (activo == "AAPL") "APPL_5m.xlsx" else paste0(activo, "_5m.xlsx")
+  encabezado <- saltos_5m[[activo]] + 1L
+
+  x <- readxl::read_excel(
+    archivo,
+    range = readxl::cell_limits(c(encabezado, 2L), c(NA, 5L)),
+    col_types = c("date", "skip", "skip", "numeric")
+  )
+
+  segundos <- round(as.numeric(x[["Exchange Time"]]))
+  cierre <- x[["Close"]]
+  ok <- is.finite(segundos) & segundos %% 300 == 0 &
+    is.finite(cierre) & cierre > 0
+
+  if (!any(ok)) stop("No se leyeron cierres válidos en ", archivo)
+
+  d <- data.frame(
+    Hora = as.POSIXct(segundos[ok], origin = "1970-01-01", tz = "UTC"),
+    Close = cierre[ok]
+  )
+  if (anyDuplicated(d$Hora)) stop("Horas duplicadas en ", archivo)
+  names(d)[2] <- activo
+  d
+}
+
+precios_5m <- Reduce(function(x, y) merge(x, y, by = "Hora"),
+                     lapply(names(saltos_5m), leer_5m))
+precios_5m <- precios_5m[order(precios_5m$Hora), ]
+stopifnot(nrow(precios_5m) > 1L)
+
+# Se omiten huecos y saltos de una sesión a otra: ambos extremos deben
+# estar separados por exactamente 300 segundos.
+continuo_5m <- as.numeric(diff(precios_5m$Hora), units = "secs") == 300
+r_5m <- as.data.frame(100 * diff(log(as.matrix(precios_5m[-1]))))
+r_5m <- r_5m[continuo_5m, , drop = FALSE]
+horas_5m <- precios_5m$Hora[-1][continuo_5m]
+cat("Muestra común:", nrow(r_5m), "rendimientos, del",
+    format(min(horas_5m), "%d/%m/%Y", tz = "UTC"), "al",
+    format(max(horas_5m), "%d/%m/%Y", tz = "UTC"))
+```
+Las bandas convencionales de confianza muestran la incertidumbre sobre el rendimiento medio estimado para un valor dado de VOO. Las de predicción son más amplias porque corresponden a una observación individual del mismo intervalo. No son pronósticos de la siguiente barra.
+
+
+
+## Regresión múltiple a 5 minutos
+
+Se estima el rendimiento de VOO a partir de los rendimientos contemporáneos de las diez acciones. Cada coeficiente mide la asociación con VOO manteniendo constantes los rendimientos de las demás acciones.
+
+```{r multiple-lseg-5m}
+multiple_5m <- lm(VOO ~ ., data = r_5m)
+summary(multiple_5m)
+```
+
+El modelo explicó el 84.38% de la variación del rendimiento de VOO en la muestra de cinco minutos, con un \(R^2\) ajustado de 83.68%. La prueba F convencional (\(F=121.5\), \(p<2.2\times10^{-16}\)) rechaza que las diez pendientes sean simultáneamente iguales a cero. Al nivel del 5%, siete acciones presentaron una asociación individual estadísticamente significativa con VOO: AAPL, MSFT, AVGO, AMZN, JPM, XOM y UNP. ULTA fue significativa al 10%, mientras que TJX y ADM no lo fueron a ese nivel. AMZN tuvo el coeficiente más alto (0.1474): un aumento de un punto porcentual en su rendimiento se asoció con un aumento estimado de 0.1474 puntos porcentuales en el rendimiento de VOO durante el mismo intervalo, manteniendo constantes los rendimientos de las demás acciones. El ajuste describe relaciones contemporáneas en la muestra; no mide capacidad de pronóstico ni demuestra causalidad.
+
+
+
+La hora se lee tal como está en la columna **Exchange Time** del exportado, sin desplazar el reloj. Para UNP se toman únicamente cierres en múltiplos exactos de cinco minutos, porque el archivo contiene marcas intermedias.
+
+```{r simples-lseg-modelos}
+acciones_5m <- setdiff(names(saltos_5m), "VOO")
+simples_5m <- setNames(lapply(acciones_5m, function(activo) {
+  lm(reformulate("VOO", response = activo), data = r_5m)
+}), acciones_5m)
+
+tabla_5m <- do.call(rbind, lapply(acciones_5m, function(activo) {
+  m <- simples_5m[[activo]]
+  s <- summary(m)
+  b <- coef(s)["VOO", ]
+  ic <- confint(m, "VOO", level = 0.95)
+  data.frame(Accion = activo, N = nobs(m), Alfa = unname(coef(m)[1]),
+             Beta = b[[1]], Error_estandar = b[[2]], t = b[[3]],
+             p = format.pval(b[[4]], digits = 3),
+             IC95_inf = ic[1, 1], IC95_sup = ic[1, 2],
+             R2 = s$r.squared, R2_ajustada = s$adj.r.squared)
+}))
+knitr::kable(tabla_5m, digits = 4, row.names = FALSE,
+             caption = "Regresiones simples de cada acción frente a VOO")
+```
+
+En esta ventana, AMZN presenta el mayor R² (41.33%), seguido de AAPL (40.00%). AVGO tiene la beta más alta (1.56): un aumento de un punto porcentual en el rendimiento de VOO se asocia con aproximadamente 1.56 puntos porcentuales adicionales en el rendimiento estimado de AVGO en el mismo intervalo. XOM registra el menor R² (4.11%); una pendiente distinta de cero bajo la prueba convencional no implica que VOO explique una gran proporción de sus movimientos. Los errores estándar, las pruebas t y los intervalos reportados son los convencionales de MCO y deben interpretarse con cautela ante posible dependencia o heterocedasticidad intradía.
+
+### Regresiones simples seleccionadas
+
+VOO está en el eje horizontal y la acción en el vertical. Cada punto
+representa un intervalo de cinco minutos.
+
+```{r graficas-regresiones-simples, fig.width=10, fig.height=4.5}
+local({
+  rango_voo <- range(r_5m$VOO)
+  rejilla <- data.frame(VOO = seq(rango_voo[1], rango_voo[2],
+                                  length.out = 100))
+
+  op <- par(mfrow = c(1, 2), mar = c(4, 4, 3, 1))
+
+  for (ticker in c("AMZN", "AVGO")) {
+    modelo <- simples_5m[[ticker]]
+    ic <- predict(modelo, newdata = rejilla,
+                  interval = "confidence", level = 0.95)
+    ip <- predict(modelo, newdata = rejilla,
+                  interval = "prediction", level = 0.95)
+
+    plot(r_5m$VOO, r_5m[[ticker]], pch = 20, cex = 0.65,
+         col = "grey45", ylim = range(r_5m[[ticker]], ip),
+         main = paste(ticker, "frente a VOO"),
+         xlab = "Rendimiento de VOO (%)",
+         ylab = paste("Rendimiento de", ticker, "(%)"))
+    abline(modelo, col = "#0072B2", lwd = 2)
+    matlines(rejilla$VOO, ic[, 2:3], col = "#D55E00", lty = 2)
+    matlines(rejilla$VOO, ip[, 2:3], col = "#009E73", lty = 3)
+
+    legend("topleft", c("Recta ajustada", "Confianza 95%", "Predicción 95%"),
+           col = c("#0072B2", "#D55E00", "#009E73"),
+           lty = 1:3, bty = "n", cex = 0.8)
+  }
+
+  par(op)
+})
+```
+
+
+
+## Datos y universo
+
+```{r datos}
+library(quantmod)
+
+acciones <- c("AAPL", "MSFT", "AVGO", "AMZN", "ULTA", "TJX",
+              "JPM", "XOM", "ADM", "UNP")
+tickers <- c(acciones, "VOO")
+inicio <- as.Date("2023-01-01")
+corte <- as.Date("2026-11-06")  # actualizar al último cierre completo
+
+descargar <- function(ticker) {
+  x <- getSymbols(ticker, src = "yahoo", from = inicio, to = corte + 1L,
+                  auto.assign = FALSE)
+  p <- Ad(x)
+  p <- p[zoo::index(p) <= corte]
+  if (!NROW(p) || anyDuplicated(zoo::index(p)) ||
+      as.Date(tail(zoo::index(p), 1)) != corte || any(!is.finite(p) | p <= 0))
+    stop("Revisar precios o fecha de corte de ", ticker, call. = FALSE)
+  colnames(p) <- ticker
+  p
+}
+
+series <- lapply(tickers, descargar)
+fechas <- zoo::index(series[[1]])
+if (!all(vapply(series, function(x) identical(zoo::index(x), fechas), logical(1))))
+  stop("Las fechas no coinciden. Revisar los datos antes de calcular rendimientos.")
+precios <- do.call(merge, series)
+R <- as.matrix(na.omit(100 * diff(log(precios))))
+fechas_r <- fechas[-1L]
+stopifnot(nrow(R) > 260L)
+knitr::kable(data.frame(Activo = tickers, Sesiones = nrow(R),
+                        Corte = corte, Media_pct = colMeans(R),
+                        Vol_diaria_pct = apply(R, 2, sd)), digits = 3)
+```
+
+### Evolución de los precios ajustados
+
+Cada serie comienza en 100 en la primera fecha común. Un valor de 150
+representa un aumento acumulado de 50% respecto al cierre ajustado inicial.
+
+```{r graficas-precios-portafolio, fig.width=10, fig.height=6}
+local({
+  fechas_g <- as.Date(zoo::index(precios))
+  cierres_g <- as.matrix(precios)
+  base100_g <- 100 * sweep(cierres_g, 2, cierres_g[1, ], "/")
+
+  grupos_g <- list(
+    c("AAPL", "MSFT", "AVGO", "AMZN", "ULTA", "VOO"),
+    c("TJX", "JPM", "XOM", "ADM", "UNP", "VOO")
+  )
+  colores_g <- c("#0072B2", "#D55E00", "#009E73",
+                 "#CC79A7", "#906000", "#222222")
+  escala_g <- range(base100_g, finite = TRUE)
+
+  op <- par(mfrow = c(2, 1), mar = c(3, 4, 2, 1))
+
+  for (grupo in grupos_g) {
+    plot(fechas_g, base100_g[, "VOO"], type = "n",
+     log = "y", ylim = escala_g, xlab = "",
+     ylab = "Base 100 (escala logarítmica)")
+    abline(h = 100, col = "grey80")
+    for (j in seq_along(grupo)) {
+      lines(fechas_g, base100_g[, grupo[j]], col = colores_g[j],
+            lwd = if (grupo[j] == "VOO") 2 else 1,
+            lty = if (grupo[j] == "VOO") 2 else 1)
+    }
+    legend("topleft", legend = grupo, col = colores_g,
+           lty = c(rep(1, 5), 2), lwd = c(rep(1, 5), 2),
+           horiz = TRUE, bty = "n", cex = 0.8)
+  }
+
+  par(op)
+})
+```
+
+AVGO mostró la mayor apreciación acumulada del grupo, aunque también registró retrocesos desde sus máximos. La escala logarítmica permite comparar los cambios porcentuales de las demás acciones frente a VOO sin que la trayectoria de AVGO comprima tanto las otras series. La gráfica muestra cuánto avanzó cada activo desde el inicio; la tabla de volatilidad complementa esa lectura al medir cuánto variaron sus rendimientos diarios.
+
+
+
+## Modelos y selección de predictores
+
+La caminata aleatoria sin deriva pronostica un cambio de cero. El AR(1) en rendimientos equivale a un ARIMA(1,1,0) con deriva en logprecios. La regresión usa el rendimiento de la acción y el de VOO conocidos al cierre del origen; la variable dependiente es el rendimiento acumulado posterior. Se usa una regresión distinta para cada horizonte.
+
+```{r funciones}
+ajustar <- function(ticker, t, h) {
+  r <- R[, ticker]
+  m <- R[, "VOO"]
+  # El último objetivo usado para estimar termina en t.
+  i <- seq_len(t - h)
+  acumulado <- c(0, cumsum(r))
+  datos <- data.frame(y = acumulado[i + h + 1L] - acumulado[i + 1L],
+                      propio = r[i], mercado = m[i])
+  lm(y ~ propio + mercado, data = datos)
+}
+
+pronosticar <- function(ticker, t, h) {
+  r <- R[, ticker]
+  m <- R[, "VOO"]
+  ar <- tryCatch(
+    stats::arima(r[seq_len(t)], order = c(1, 0, 0), method = "ML"),
+    error = function(e) NULL
+  )
+  c(Caminata = 0,
+    ARIMA = if (!is.null(ar) && isTRUE(ar$code == 0))
+      sum(predict(ar, n.ahead = h)$pred) else NA_real_,
+    Regresion = as.numeric(predict(ajustar(ticker, t, h),
+                                   newdata = data.frame(propio = r[t], mercado = m[t]))))
+}
+```
+
+## Evaluación cronológica y pronóstico
+
+Por activo y horizonte, los primeros 40 orígenes eligen el modelo por RMSE y los últimos 40 evalúan esa elección frente a la referencia. Se deja un origen de separación para que el último objetivo de selección ya se conozca al iniciar la evaluación. Cada ajuste usa solo información disponible en su origen. Las pruebas t de la regresión son descriptivas: a dos sesiones los objetivos se solapan y los errores estándar convencionales pueden ser inadecuados.
+
+```{r evaluar}
+n <- nrow(R)
+evaluar <- function(ticker, h) {
+  modelos <- c("Caminata", "ARIMA", "Regresion")
+  seleccion <- seq.int(n - h - 80L, n - h - 41L)
+  prueba <- seq.int(n - h - 39L, n - h)
+  origenes <- c(seleccion, prueba)
+  pred <- t(vapply(origenes, function(t) pronosticar(ticker, t, h),
+                   setNames(numeric(3), modelos)))
+  colnames(pred) <- modelos
+  observado <- vapply(origenes, function(t)
+    sum(R[seq.int(t + 1L, t + h), ticker]), numeric(1))
+  e <- observado - pred
+  rmse <- function(x) if (all(is.finite(x))) sqrt(mean(x^2)) else Inf
+  ganador <- modelos[which.min(apply(e[seq_along(seleccion), , drop = FALSE], 2, rmse))]
+  idx <- length(seleccion) + seq_along(prueba)
+  error <- e[idx, ganador]
+  futuro <- pronosticar(ticker, n, h)[[ganador]]
+  banda <- if (all(is.finite(error)))
+    futuro + quantile(error, c(.05, .95), names = FALSE) else c(NA_real_, NA_real_)
+  co <- coef(summary(ajustar(ticker, max(seleccion), h)))
+  list(tabla = data.frame(Activo = ticker, Horizonte = h, Modelo = ganador,
+                          RMSE_prueba = rmse(error),
+                          RMSE_caminata = rmse(e[idx, "Caminata"]),
+                          MAE_prueba = mean(abs(error)),
+                          Pronostico_pct = futuro,
+                          P05_empirico_pct = banda[1],
+                          P95_empirico_pct = banda[2],
+                          P_propio_conv = co["propio", "Pr(>|t|)"],
+                          P_VOO_conv = co["mercado", "Pr(>|t|)"]),
+       error = error, fechas = fechas_r[prueba])
+}
+
+resultados <- lapply(1:2, function(h) lapply(acciones, evaluar, h = h))
+tabla <- do.call(rbind, lapply(unlist(resultados, recursive = FALSE), "[[", "tabla"))
+knitr::kable(tabla, digits = 4)
+```
+
+En la muestra de prueba, solo el modelo seleccionado para JPM a una sesión redujo el RMSE frente a la caminata aleatoria: de 1.4205 a 1.4181 puntos porcentuales. La mejora fue marginal y no se repitió en los demás casos. Por tanto, la evaluación no muestra una ventaja predictiva consistente. El buen ajuste de la regresión intradía responde a una pregunta distinta: cuánto se movieron juntos los activos en el mismo intervalo.
+
+
+
+## Escenarios del portafolio
+
+Ejemplo con pesos iguales al inicio del horizonte. Se remuestrean vectores completos de errores fuera de muestra para conservar movimientos conjuntos, y se suman al pronóstico en escala logarítmica. Los percentiles son escenarios empíricos aproximados, no probabilidades garantizadas; solo se disponen de 40 orígenes de prueba por horizonte.
+
+```{r escenarios}
+set.seed(2026)
+for (h in 1:2) {
+  bloque <- resultados[[h]]
+  errores <- do.call(cbind, lapply(bloque, "[[", "error"))
+  centro <- tabla$Pronostico_pct[tabla$Horizonte == h]
+  ok <- complete.cases(errores) & apply(is.finite(errores), 1, all)
+  if (sum(ok) < 30L || any(!is.finite(centro))) {
+    cat("Horizonte", h, ": datos insuficientes para simular.\n")
+    next
+  }
+  filas <- sample(which(ok), 2000, replace = TRUE)
+  sim <- sweep(errores[filas, , drop = FALSE], 2, centro, "+")
+  p <- 100 * rowMeans(expm1(sim / 100))
+  hist(p, breaks = 25, col = "steelblue", border = "white",
+       main = paste("Portafolio de pesos iguales:", h, "sesiones"),
+       xlab = "Rendimiento acumulado (%)")
+  q <- quantile(p, c(.05, .50, .95))
+  abline(v = q, lty = 2)
+  print(round(q, 3))
+}
+```
+
+Para la cartera equiponderada, el rango entre los percentiles 5 y 95 fue de −0.995% a 1.705% a una sesión y de −1.685% a 1.682% a dos sesiones. Aunque las medianas fueron ligeramente positivas, ambos rangos abarcan cero y contemplan pérdidas y ganancias. La simulación ayuda a dimensionar el riesgo de corto plazo, pero no aporta una señal clara de compra o venta.
+
+
+
+## Indicadores técnicos MACD y RSI
+
+Se calculan el MACD (12, 26 y 9 sesiones) y el RSI (14 sesiones) sobre los cierres ajustados diarios. La tabla muestra la lectura al último cierre disponible para cada una de las diez acciones.
+
+```{r indicadores-macd-rsi}
+
+fecha_tecnica <- as.Date(tail(zoo::index(precios), 1))
+
+tabla_tecnica <- do.call(rbind, lapply(acciones, function(ticker) {
+  cierre <- as.numeric(precios[, ticker])
+
+  macd <- TTR::MACD(cierre, nFast = 12, nSlow = 26, nSig = 9,
+                    maType = "EMA", percent = FALSE)
+  ultimo <- macd[nrow(macd), ]
+  rsi <- tail(TTR::RSI(cierre, n = 14), 1)
+
+  data.frame(
+    Accion = ticker,
+    MACD = ultimo[["macd"]],
+    Linea_senal = ultimo[["signal"]],
+    Lectura_MACD = if (ultimo[["macd"]] > ultimo[["signal"]]) {
+      "Por encima de la señal"
+    } else if (ultimo[["macd"]] < ultimo[["signal"]]) {
+      "Por debajo de la señal"
+    } else {
+      "Igual a la señal"
+    },
+    RSI_14 = rsi,
+    Zona_RSI = if (rsi >= 70) {
+      "Sobrecompra"
+    } else if (rsi <= 30) {
+      "Sobreventa"
+    } else {
+      "Intermedia"
+    }
+  )
+}))
+
+knitr::kable(tabla_tecnica, digits = 3, row.names = FALSE,
+             caption = paste("MACD y RSI al cierre del", fecha_tecnica))
+```
+
+La posición del MACD respecto a su línea de señal describe el impulso al cierre, pero no confirma que haya ocurrido un cruce ese día. Un RSI en sobrecompra o sobreventa tampoco garantiza una reversión del precio. Estos indicadores complementan el análisis; el backtest sigue evaluando la regla de la media móvil de 50 sesiones.
+
+
+
+## Backtest diario
+
+Cada acción recibe inicialmente un décimo del capital, en efectivo. Cuando su cierre ajustado supera su media móvil de 50 sesiones, se invierte la fracción asignada a esa acción; de lo contrario, se mantiene en efectivo. La señal se conoce al cierre y se ejecuta al cierre de la sesión siguiente. La ventana de 50 sesiones se fija sin optimizarla sobre la muestra. Esta regla se evalúa por separado de los pronósticos de una y dos sesiones.
+
+El capital inicial es de USD 1,000,000, sin ventas en corto ni apalancamiento. Se permiten unidades fraccionarias y se usan cierres ajustados como aproximación, sin modelar deslizamiento ni intereses sobre efectivo. Se descuentan USD 10 por compra o venta como supuesto basado en la comisión promedio observada. Al final se valoran las posiciones abiertas sin forzar su liquidación.
+
+```{r backtest}
+capital_bt <- 1000000
+costo_bt <- 10
+ventana_bt <- 50L
+P_bt <- as.matrix(precios)
+filas_bt <- seq.int(ventana_bt + 1L, nrow(P_bt))
+fechas_bt <- as.Date(fechas)[filas_bt]
+
+senal_bt <- sapply(acciones, function(activo) {
+  p <- P_bt[, activo]
+  media <- stats::filter(p, rep(1 / ventana_bt, ventana_bt), sides = 1)
+  (p > as.numeric(media))[filas_bt - 1L]  # señal del cierre anterior
+})
+
+simular_bt <- function(precio, senal, capital, costo) {
+  efectivo <- capital
+  unidades <- 0
+  operaciones <- 0L
+  valor <- numeric(length(precio))
+  for (i in seq_along(precio)) {
+    if (senal[i] && unidades == 0 && efectivo > costo) {
+      unidades <- (efectivo - costo) / precio[i]
+      efectivo <- 0
+      operaciones <- operaciones + 1L
+    } else if (!senal[i] && unidades > 0) {
+      efectivo <- unidades * precio[i] - costo
+      unidades <- 0
+      operaciones <- operaciones + 1L
+    }
+    valor[i] <- efectivo + unidades * precio[i]
+  }
+  list(valor = valor, operaciones = operaciones)
+}
+
+cartera_bt <- function(senales, costo) {
+  posiciones <- lapply(acciones, function(activo)
+    simular_bt(P_bt[filas_bt, activo], senales[, activo],
+               capital_bt / length(acciones), costo))
+  list(valor = rowSums(sapply(posiciones, function(x) x$valor)),
+       operaciones = sum(sapply(posiciones, function(x) x$operaciones)))
+}
+
+resultados_bt <- list(
+  "Media móvil, neta" = cartera_bt(senal_bt, costo_bt),
+  "Media móvil, sin comisiones" = cartera_bt(senal_bt, 0),
+  "Mantener las diez acciones" = cartera_bt(senal_bt | TRUE, costo_bt),
+  "Mantener VOO" = simular_bt(P_bt[filas_bt, "VOO"],
+                              rep(TRUE, length(filas_bt)), capital_bt, costo_bt)
+)
+```
+
+### Rendimiento y riesgo
+
+Las referencias son comprar y mantener las mismas diez acciones, con pesos iniciales iguales, y comprar y mantener VOO. Ambas empiezan en la misma fecha y pagan el mismo costo por orden. La primera comparación ayuda a distinguir el efecto de la regla del efecto de seleccionar esas diez acciones. La volatilidad se anualiza con 252 sesiones y la caída máxima se mide desde el máximo previo de la cartera.
+
+```{r backtest-resultados}
+tabla_bt <- do.call(rbind, lapply(names(resultados_bt), function(nombre) {
+  x <- resultados_bt[[nombre]]
+  curva <- c(capital_bt, x$valor)
+  r <- curva[-1L] / head(curva, -1L) - 1
+  data.frame(
+    Estrategia = nombre,
+    Rendimiento_pct = 100 * (tail(curva, 1L) / capital_bt - 1),
+    Volatilidad_anual_pct = 100 * sqrt(252) * sd(r),
+    Caida_maxima_pct = 100 * max(1 - curva / cummax(curva)),
+    Operaciones = x$operaciones,
+    Valor_final_USD = tail(curva, 1L)
+  )
+}))
+knitr::kable(tabla_bt, digits = 2,
+             caption = paste("Backtest:", min(fechas_bt), "a", max(fechas_bt)))
+
+curvas_bt <- resultados_bt[c(1, 3, 4)]
+indice_bt <- sapply(curvas_bt, function(x) 100 * x$valor / capital_bt)
+colores_bt <- c("#155E75", "#4D7C0F", "#B45309")
+plot(fechas_bt, indice_bt[, 1], type = "n", ylim = range(indice_bt),
+     xlab = "Fecha", ylab = "Valor de la cartera (capital inicial = 100)")
+for (j in seq_len(ncol(indice_bt)))
+  lines(fechas_bt, indice_bt[, j], col = colores_bt[j], lwd = 2)
+legend("topleft", names(curvas_bt), col = colores_bt, lwd = 2, bty = "n")
+```
+
+La comparación entre los escenarios con y sin comisiones muestra el efecto de los costos bajo los supuestos del ejercicio. Una diferencia frente a VOO también puede reflejar que la estrategia mantiene parte del capital en efectivo. El ejercicio evalúa estas diez acciones en una ventana histórica específica.
+
+La regla de media móvil de 50 sesiones obtuvo un rendimiento acumulado neto de 39.30%, frente a 95.28% de VOO y 120.85% de la cartera que mantuvo las mismas diez acciones. A cambio, registró la menor volatilidad anualizada (10.48%) y la menor caída máxima (9.56%). Las comisiones redujeron el rendimiento en 0.75 puntos porcentuales, por lo que explican solo una pequeña parte de la brecha. En el periodo analizado, la regla funcionó como una alternativa defensiva: limitó las caídas, pero sacrificó rendimiento. Este resultado corresponde al backtest histórico; las operaciones de HowTheMarketWorks se documentan por separado.
+
+
+
+## Panel trimestral
+
+```{r datos-panel}
+library(readxl)
+library(zoo)
+library(plm)
+
+leer_fila <- function(archivo, hoja, fila) {
+  valores <- read_excel(
+    archivo, sheet = hoja,
+    range = cell_limits(c(fila, 2), c(fila, NA)),
+    col_names = FALSE, col_types = "numeric"
+  )
+  as.numeric(unlist(valores, use.names = FALSE))
+}
+
+# Extraer las cinco cuentas y sus fechas de cierre.
+leer_empresa <- function(archivo, empresa, fila_activos, fila_ingresos,
+                         fila_utilidad, fila_flujo, fila_capex) {
+  fechas <- read_excel(
+    archivo, sheet = "Balance Sheet",
+    range = cell_limits(c(12, 2), c(12, NA)),
+    col_names = FALSE, col_types = "date"
+  )
+
+  data.frame(
+    empresa = empresa,
+    fecha = as.Date(do.call(c, fechas)),
+    activos = leer_fila(archivo, "Balance Sheet", fila_activos),
+    ingresos = leer_fila(archivo, "Income Statement", fila_ingresos),
+    utilidad_operativa = leer_fila(archivo, "Income Statement", fila_utilidad),
+    flujo_operativo = leer_fila(archivo, "Cash Flow", fila_flujo),
+    capex = if (is.na(fila_capex)) NA_real_ else leer_fila(archivo, "Cash Flow", fila_capex)
+  )
+}
+
+# Orden de filas: activos, ingresos, utilidad operativa, flujo operativo, compras PP&E.
+AAPL <- leer_empresa("AAPL_all.xlsx", "AAPL", 52, 19, 31, 31, 35)
+MSFT <- leer_empresa("MSFT_all.xlsx", "MSFT", 68, 19, 29, 32, 36)
+AVGO <- leer_empresa("AVGO_all.xlsx", "AVGO", 79, 21, 30, 37, 41)
+AMZN <- leer_empresa("AMZN_all.xlsx", "AMZN", 61, 19, 36, 32, 36)
+ULTA <- leer_empresa("ULTA_all.xlsx", "ULTA", 42, 19, 36, 38, 42)
+TJX  <- leer_empresa("TJX_all.xlsx",  "TJX",  48, 19, 30, 35, 39)
+# JPM: la exportación no contiene compras brutas de PP&E comparables.
+# NA significa no disponible, no cero. No se sustituye por CAPEX neto.
+JPM  <- leer_empresa("JPM_all.xlsx",  "JPM",  48, 43, 57, 38, NA_integer_)
+XOM  <- leer_empresa("XOM_all.xlsx",  "XOM",  37, 19, 36, 28, 32)
+ADM  <- leer_empresa("ADM_all.xlsx",  "ADM",  58, 19, 27, 35, 39)
+UNP  <- leer_empresa("UNP_all.xlsx",  "UNP",  63, 20, 37, 31, 35)
+
+datos <- rbind(AAPL, MSFT, AVGO, AMZN, ULTA, TJX, JPM, XOM, ADM, UNP)
+```
+
+En el panel base, el flujo operativo sobre activos del trimestre anterior mantuvo una asociación positiva con el margen operativo tanto en efectos fijos como en aleatorios. Para CAPEX, el coeficiente fue negativo en ambas especificaciones, pero solo fue significativo al 5% en efectos fijos (p = 0.0244, frente a p = 0.0769 en efectos aleatorios). Con nueve empresas en la extensión, el resultado es sensible a la especificación y no demuestra que invertir en CAPEX reduzca el margen.
+
+
+
+## Ventana y variables
+
+La fecha original se conserva. Para etiquetar el trimestre se restan 35 días a los cierres de ULTA y TJX y siete días al resto; esta regla corresponde a las fechas de estas exportaciones. Por ejemplo, el cierre del 31 de enero de 2026 se asigna a 2025T4 en ULTA y TJX. Los rezagos se calculan antes de recortar la muestra.
+
+```{r panel}
+dias <- ifelse(datos$empresa %in% c("ULTA", "TJX"), 35, 7)
+datos$trimestre <- as.integer(round(4 * as.numeric(as.yearqtr(datos$fecha - dias))))
+datos$margen <- 100 * datos$utilidad_operativa / datos$ingresos
+datos$flujo <- 100 * datos$flujo_operativo / datos$activos
+datos$tamano <- log(datos$activos)
+datos$capex_activos <- 100 * datos$capex / datos$activos
+
+stopifnot(!anyDuplicated(datos[c("empresa", "trimestre")]))
+panel <- pdata.frame(datos, index = c("empresa", "trimestre"))
+panel$flujo_l1 <- stats::lag(panel$flujo, k = 1)
+panel$tamano_l1 <- stats::lag(panel$tamano, k = 1)
+panel$capex_l1 <- stats::lag(panel$capex_activos, k = 1)
+periodo <- as.integer(as.character(panel$trimestre))
+panel <- panel[periodo >= 4 * 2021 & periodo <= 4 * 2025 + 3, ]
+stopifnot(nrow(panel) == 200L, length(unique(panel$empresa)) == 10L,
+          is.pbalanced(panel), all(complete.cases(panel[, c("margen", "flujo_l1", "tamano_l1")])))
+pdim(panel)
+```
+
+## Modelo base: diez empresas
+
+La dependiente es el margen operativo antes de partidas no recurrentes. Los regresores son flujo operativo/activos y logaritmo de activos, ambos rezagados un trimestre. JPM se incluye; su modelo de negocio bancario limita la comparabilidad económica del margen y del flujo con las demás empresas.
+
+```{r base}
+f_base <- margen ~ flujo_l1 + tamano_l1
+pooled <- plm(f_base, data = panel, model = "pooling")
+fijos <- plm(f_base, data = panel, model = "within")
+aleatorios <- plm(f_base, data = panel, model = "random")
+summary(pooled)
+summary(fijos)
+summary(aleatorios)
+
+pFtest(fijos, pooled)
+phtest(fijos, aleatorios)
+pwartest(fijos)
+pcdtest(fijos, test = "cd")
+```
+
+## Extensión CAPEX: comparación sobre las mismas nueve empresas
+
+```{r capex}
+panel_9 <- panel[panel$empresa != "JPM", ]
+stopifnot(nrow(panel_9) == 180L, all(is.finite(panel_9$capex_l1)))
+
+f_capex <- update(f_base, . ~ . + capex_l1)
+comparar <- function(tipo) {
+  base_9 <- plm(f_base, data = panel_9, model = tipo)
+  capex_9 <- plm(f_capex, data = panel_9, model = tipo)
+  list(Sin_CAPEX = coef(summary(base_9)), Con_CAPEX = coef(summary(capex_9)))
+}
+for (tipo in c("pooling", "within", "random")) {
+  cat("\nModelo:", tipo, "\n")
+  print(comparar(tipo))
+}
+```
+
+Comparar signo, magnitud e incertidumbre de los coeficientes dentro de cada par. Las diferencias se interpretan manteniendo constantes empresas, trimestres y estimador. El rezago ordena temporalmente las variables, pero no identifica causalidad.
+
+
+
+```{r}
+
+agrupados <- function(modelo) {
+  G <- plm::pdim(modelo)$nT$n
+  V <- plm::vcovHC(modelo, method = "arellano",
+                   type = "HC1", cluster = "group")
+  lmtest::coeftest(modelo, vcov. = V, df = G - 1)
+}
+
+agrupados(fijos)
+agrupados(aleatorios)
+
+agrupados(plm(f_capex, data = panel_9, model = "within"))
+agrupados(plm(f_capex, data = panel_9, model = "random"))
+```
+
+
+
+## Evidencia de HowTheMarketWorks
+
+El historial registra seis compras a mercado el 12 de octubre de 2026 (AMZN, MSFT, ULTA, ADM, JPM y VOO) y una compra adicional de VOO el 16 de octubre. Las siete compras sumaron USD 441,696. Con USD 70 de comisiones, el saldo de efectivo fue de USD 558,234.
+
+La captura de saldos muestra un valor de cuenta de USD 995,831.50 (−0.42% sobre el capital inicial) y un rendimiento de −4.90% para la referencia SPY de la plataforma. Estas cifras corresponden a las compras ejecutadas en HowTheMarketWorks. El backtest es un ejercicio independiente y usa VOO como referencia.
+
+La cuenta perdió 0.42% al corte, frente a la caída de 4.90% que la plataforma reportó para SPY. La diferencia fue de 4.48 puntos porcentuales a favor de la cuenta, pero cerca del 56% de su valor permanecía en efectivo al corte. Esa comparación no permite atribuir la diferencia a la selección de acciones.
+
+
+
+## Sección C Perfil de riesgo y selección de instrumentos
+
+El universo de inversión está formado por AAPL, MSFT, AVGO, AMZN, ULTA,
+TJX, JPM, XOM, ADM y UNP. VOO se mantiene como referencia y no entra en
+la selección. Se reutilizan los rendimientos logarítmicos diarios de los
+cierres ajustados de Yahoo Finance. Las series se alinearon por fecha
+y se verificó que los precios fueran válidos antes de calcular los
+rendimientos. Para cada acción se reportan el rendimiento medio diario
+y la desviación estándar diaria, ambos en porcentaje.
+
+### Cuestionario de opción múltiple
+
+| Pregunta | A | B | C |
+|---|---|---|---|
+| 1. ¿Cuándo necesitarías usar este capital? | En menos de un año | En uno a tres años | En más de tres años |
+| 2. ¿Cuál es tu objetivo principal? | Preservar el capital | Equilibrar crecimiento y estabilidad | Buscar crecimiento aceptando fluctuaciones amplias |
+| 3. Si la inversión cae 15%, ¿qué harías? | Reduciría la exposición | Revisaría si cambió la razón para invertir | Mantendría la posición si la razón sigue vigente |
+| 4. ¿Qué pérdida temporal tolerarías sin comprometer tus gastos? | Menos de 10% | Entre 10% y 20% | Más de 20% |
+
+A suma 1 punto, B suma 2 y C suma 3. De 4 a 6 puntos se clasifica como
+conservador; de 7 a 9, moderado; y de 10 a 12, agresivo. Si el horizonte
+es menor de un año, el ejercicio no selecciona acciones para ese capital.
+Si la capacidad de absorber pérdidas es baja, el perfil se limita a
+conservador. La escala es una regla académica del proyecto.
+
+```{r perfil-riesgo-seccion-c}
+# Ejemplo hipotético. Sustituir por las respuestas del cliente si se aplica.
+respuestas_c <- c("B", "B", "B", "B")
+puntos_c <- c(A = 1L, B = 2L, C = 3L)
+
+stopifnot(length(respuestas_c) == 4L,
+          all(respuestas_c %in% names(puntos_c)))
+
+puntaje_c <- sum(puntos_c[respuestas_c])
+
+perfil_c <- if (puntaje_c <= 6L) {
+  "Conservador"
+} else if (puntaje_c <= 9L) {
+  "Moderado"
+} else {
+  "Agresivo"
+}
+
+if (respuestas_c[4] == "A") perfil_c <- "Conservador"
+
+cat("Respuestas:", paste(respuestas_c, collapse = ", "), "\n")
+cat("Puntaje:", puntaje_c, "de 12\n")
+cat("Perfil:", perfil_c, "\n")
+
+if (respuestas_c[1] == "A") {
+  cat("Horizonte menor de un año: no se seleccionan acciones.\n")
+}
+```
+
+### Riesgo histórico e instrumentos compatibles
+
+El filtro ordena las acciones de menor a mayor volatilidad histórica.
+Para el perfil conservador pasan las tres de menor volatilidad; para
+el moderado, las seis de menor volatilidad; y para el agresivo, las diez
+quedan disponibles para análisis. El rendimiento medio se muestra para
+comparar los instrumentos, pero no se usa como pronóstico ni como
+criterio de selección. La compatibilidad es relativa a este universo
+de acciones: incluso las de menor volatilidad pueden sufrir pérdidas.
+
+```{r instrumentos-seccion-c, fig.width=8, fig.height=4.5}
+r_c <- R[, acciones, drop = FALSE]
+
+riesgo_c <- data.frame(
+  Accion = colnames(r_c),
+  Media_diaria_pct = colMeans(r_c),
+  Volatilidad_diaria_pct = apply(r_c, 2, sd)
+)
+
+riesgo_c <- riesgo_c[order(riesgo_c$Volatilidad_diaria_pct,
+                           riesgo_c$Accion), ]
+
+limites_c <- c(Conservador = 3L, Moderado = 6L, Agresivo = 10L)
+n_c <- if (respuestas_c[1] == "A") 0L else limites_c[[perfil_c]]
+
+riesgo_c$Compatible <- ifelse(seq_len(nrow(riesgo_c)) <= n_c, "Sí", "No")
+seleccion_c <- riesgo_c[riesgo_c$Compatible == "Sí", ]
+
+knitr::kable(
+  riesgo_c, digits = 3, row.names = FALSE,
+  caption = paste("Riesgo y rendimiento diario | Perfil", perfil_c)
+)
+```
+
+```{r grafica-perfil-seccion-c, fig.width=8, fig.height=4.5}
+if (nrow(seleccion_c) > 0L) {
+  barplot(
+    rev(seleccion_c$Volatilidad_diaria_pct),
+    names.arg = rev(seleccion_c$Accion),
+    horiz = TRUE, las = 1, col = "#0072B2", border = NA,
+    main = paste("Instrumentos compatibles | Perfil", perfil_c),
+    xlab = "Volatilidad histórica diaria (%)"
+  )
+} else {
+  cat("No se genera una gráfica de selección: ningún instrumento pasa el filtro de horizonte.")
+}
+```
+
+Con las respuestas del ejemplo, el cliente obtiene 8 de 12 puntos y
+se clasifica como moderado. Por lo tanto, seis acciones pasan el filtro
+para un análisis posterior. La gráfica compara su volatilidad individual;
+el riesgo de una cartera también depende de cómo se mueven juntas las
+acciones y de los pesos asignados.
+
+
+
+```{r}
+
+recap_htmw <- do.call(rbind, lapply(acciones, function(ticker) {
+  p <- as.numeric(precios[, ticker])
+  cierre <- tail(p, 1)
+  media50 <- mean(tail(p, 50))
+
+  data.frame(
+    Accion = ticker,
+    Cierre_ajustado = round(cierre, 2),
+    Media_50 = round(media50, 2),
+    Estado_objetivo = if (cierre > media50) "Invertido" else "Efectivo"
+  )
+}))
+
+recap_htmw
+
+```
+
+
+
+
+### Órdenes propuestas y conciliación con HowTheMarketWorks
+
+#Las señales del cierre del 6 de noviembre se cruzaron con las posiciones previas del simulador. Si la señal indicaba invertir y no había posición, se estimó una compra con un presupuesto máximo de USD 100,000, incluida una comisión supuesta de USD 10. Si la señal indicaba efectivo, se propuso vender la posición existente. VOO se mantuvo fuera de esta regla.
+
+```{r ordenes-htmw}
+
+posiciones_previas <- c(MSFT = 250L, AMZN = 250L, ADM = 100L,
+                        ULTA = 100L, JPM = 100L)
+efectivo_previo <- 558234
+tope_compra <- 100000
+comision_supuesta <- 10
+
+plan_htmw <- recap_htmw
+plan_htmw$Posicion_previa <- unname(posiciones_previas[plan_htmw$Accion])
+plan_htmw$Posicion_previa[is.na(plan_htmw$Posicion_previa)] <- 0L
+plan_htmw$Cantidad_propuesta <- 0L
+efectivo_restante <- efectivo_previo
+
+for (i in seq_len(nrow(plan_htmw))) {
+  posicion <- plan_htmw$Posicion_previa[i]
+  estado <- plan_htmw$Estado_objetivo[i]
+  precio_ref <- plan_htmw$Cierre_ajustado[i]
+
+  if (estado == "Efectivo" && posicion > 0L) {
+    plan_htmw$Cantidad_propuesta[i] <- -posicion
+  } else if (estado == "Invertido" && posicion == 0L) {
+    presupuesto <- min(tope_compra, efectivo_restante)
+    cantidad <- floor(max(0, presupuesto - comision_supuesta) / precio_ref)
+    plan_htmw$Cantidad_propuesta[i] <- cantidad
+    if (cantidad > 0L) {
+      efectivo_restante <- efectivo_restante -
+        cantidad * precio_ref - comision_supuesta
+    }
+  }
+}
+
+ordenes_htmw <- subset(plan_htmw, Cantidad_propuesta != 0)
+ordenes_htmw$Orden <- ifelse(ordenes_htmw$Cantidad_propuesta > 0,
+                             "Compra", "Venta")
+ordenes_htmw$Importe_bruto_estimado_USD <- round(
+  abs(ordenes_htmw$Cantidad_propuesta) * ordenes_htmw$Cierre_ajustado, 2
+)
+
+knitr::kable(
+  ordenes_htmw[, c("Accion", "Orden", "Cantidad_propuesta",
+                   "Cierre_ajustado", "Importe_bruto_estimado_USD")],
+  row.names = FALSE, digits = 2,
+  caption = "Órdenes propuestas con precios de referencia del 6 de noviembre"
+)
+
+# Cantidad positiva = compra; cantidad negativa = venta.
+# Solo movimientos Filled del 9 de noviembre.
+ejecuciones_htmw <- data.frame(
+  Accion = c("AAPL", "UNP", "JPM", "ADM", "ADM"),
+  Cantidad = c(292L, 344L, -100L, 100L, -200L),
+  Precio_ejecucion_USD = c(348.82, 292.25, 337.73, 70.07, 70.45)
+)
+
+knitr::kable(ejecuciones_htmw, row.names = FALSE, digits = 2,
+             caption = "Operaciones ejecutadas el 9 de noviembre de 2026")
+
+neto_htmw <- aggregate(Cantidad ~ Accion, ejecuciones_htmw, sum)
+names(neto_htmw)[2] <- "Cantidad_neta_ejecutada"
+
+conciliacion_htmw <- merge(
+  ordenes_htmw[, c("Accion", "Posicion_previa", "Cantidad_propuesta")],
+  neto_htmw, by = "Accion", all = TRUE
+)
+conciliacion_htmw$Posicion_final_calculada <-
+  conciliacion_htmw$Posicion_previa + conciliacion_htmw$Cantidad_neta_ejecutada
+conciliacion_htmw$Diferencia <-
+  conciliacion_htmw$Cantidad_neta_ejecutada - conciliacion_htmw$Cantidad_propuesta
+
+knitr::kable(conciliacion_htmw, row.names = FALSE,
+             caption = "Conciliación entre cantidades propuestas y ejecutadas")
+```
+
+Las cantidades netas ejecutadas coincidieron con las propuestas: compra de 292 AAPL y 344 UNP, y salida de 100 JPM y 100 ADM. En ADM, la salida neta se logró tras una compra accidental de 100 y una venta correctiva de 200. La venta correctiva de 200 acciones de ADM se ejecutó a USD 70.45 por acción, por un importe bruto de USD 14,090 antes de comisiones.
+
+Las compras de AAPL y UNP ascendieron a USD 101,855.44 y USD 100,534.00, respectivamente, antes de comisiones. Ambas superaron el presupuesto de referencia porque las cantidades se estimaron con los cierres ajustados
+del viernes y los precios de ejecución fueron mayores. Las operaciones se realizaron durante la sesión del lunes, mientras que el backtest supone ejecución al cierre de la sesión siguiente.
+
+
+## Anexo de resultados en Excel
+
+```{r exportar-resultados-excel}
+
+writexl::write_xlsx(
+  list(
+    Regresiones_simples = tabla_5m,
+    Pronosticos = tabla,
+    MACD_RSI = tabla_tecnica,
+    Backtest = tabla_bt,
+    Perfil_riesgo = riesgo_c,
+    Ordenes_propuestas = ordenes_htmw,
+    Operaciones_ejecutadas = ejecuciones_htmw,
+    Conciliacion = conciliacion_htmw
+  ),
+  path = "Resultados_Proyecto_Final.xlsx"
+)
+
+```
